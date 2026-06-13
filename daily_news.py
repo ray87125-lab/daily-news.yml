@@ -20,9 +20,10 @@ TODAY = datetime.datetime.now(TAIPEI).strftime("%Y-%m-%d")
 
 PROMPT = f"""今天是 {TODAY}（台北時間）。請幫我彙整過去 24 小時內、另類資產管理業的重點新聞。
 
-範圍：Brookfield 生態系（BN、BIPC、BEPC、BAM、BIP、BEP、BBU、BBUC、BNT、BNRE）、Macquarie（MQG）、
-Apollo（APO）、KKR(KKR)、Blackstone(BX)、Partners Group(PHGN)、Ares(ARES)、EQT AB(EQT)、CVC capital partners(CVC)、CARLYLE GROUP(CG)、Blue Owl Capital Inc.(OWL)；以及影響這個板塊的總經因素
-（利率、私募信貸、私募股權、基礎設施與再生能源政策、商用不動產）。請特別幫我追蹤 [Brookfield、Macquarie、Apollo、KKR] 的最新交易與進度。
+範圍：Brookfield 生態系（包含母公司 Brookfield Corporation 及子公司 BN、BAM、BIPC、BEPC、BIP、BEP、BNRE 等）、Macquarie（MQG）、Apollo（APO）、KKR、
+Blackstone(BX)、Partners Group(PHGN)、Ares(ARES)、EQT AB(EQT)、CVC capital partners(CVC)、CARLYLE GROUP(CG)、Blue Owl Capital Inc.(OWL)；
+以及影響這些板塊的總經因素（利率、私募信貸、基礎設施、再生能源政策、商用不動產）。
+特別留意：上述四大巨頭在過去 24 小時內的最新實體資產交易（特別是商用不動產、房地產大宗收購、基礎設施項目進度）、併購與重組案、評等變動、配息政策、旗艦基金募資與贖回動態。
 
 要求：
 - 只收過去 24 小時的新聞，每則附上來源連結與發布時間。
