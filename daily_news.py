@@ -24,6 +24,12 @@ PROMPT = f"""今天是 {TODAY}（台北時間）。請幫我彙整過去 24 小�
 Blackstone(BX)、Partners Group(PHGN)、Ares(ARES)、EQT AB(EQT)、CVC capital partners(CVC)、CARLYLE GROUP(CG)、Blue Owl Capital Inc.(OWL)；
 以及影響這些板塊的總經因素（利率、私募信貸、基礎設施、再生能源政策、商用不動產）。
 特別留意：上述四大巨頭在過去 24 小時內的最新實體資產交易（特別是商用不動產、房地產大宗收購、基礎設施項目進度）、併購與重組案、評等變動、配息政策、旗艦基金募資與贖回動態。
+特別留意：
+- 過去 24 小時內上述公司任何「實體資產出售、購物中心或商用不動產壞帳/接管（Receiver/Distressed asset）」的新聞。
+- 管理階層（如 Bruce Flatt、Howard Marks 等）的最新對話、專訪或合作動態。
+要求：
+- 如果遇到 Bloomberg、Barron's、The Real Deal、Reuters 等媒體的付費牆（Paywall）或標題，請不要直接放棄；
+- 務必從搜尋結果的摘要（Snippets）中提煉出關鍵交易數據（例如：邁阿密地產出售金額、新澤西購物中心估值變動、Oaktree 與 Brookfield 的合作進度），並呈報上來。
 
 要求：
 - 只收過去 24 小時的新聞，每則附上來源連結與發布時間。
