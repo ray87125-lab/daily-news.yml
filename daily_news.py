@@ -1,4 +1,3 @@
-```python
 """
 每日另類資產新聞彙整 → 推送到 Telegram
 由 GitHub Actions 在雲端定時觸發，電腦不用開機。
