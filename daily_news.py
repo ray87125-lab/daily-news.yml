@@ -22,7 +22,7 @@ PROMPT = f"""今天是 {TODAY}（台北時間）。請幫我彙整過去 24 小�
 
 範圍：Brookfield 生態系（BN、BIPC、BEPC、BAM、BIP、BEP、BBU、BBUC、BNT、BNRE）、Macquarie（MQG）、
 Apollo（APO）、KKR(KKR)、Blackstone(BX)、Partners Group(PHGN)、Ares(ARES)、EQT AB(EQT)、CVC capital partners(CVC)、CARLYLE GROUP(CG)、Blue Owl Capital Inc.(OWL)；以及影響這個板塊的總經因素
-（利率、私募信貸、私募股權、基礎設施與再生能源政策、商用不動產）。
+（利率、私募信貸、私募股權、基礎設施與再生能源政策、商用不動產）。請特別幫我追蹤 [Brookfield、Macquarie、Apollo、KKR] 的最新交易與進度。
 
 要求：
 - 只收過去 24 小時的新聞，每則附上來源連結與發布時間。
