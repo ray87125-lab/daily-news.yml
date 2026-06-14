@@ -1,26 +1,41 @@
-name: Daily Alt-Asset News Digest
+name: Daily News Digest
 
 on:
   schedule:
-    # 每天台北時間 08:00 運行 (UTC 00:00)
-    - cron: '0 0 * * *'
-  workflow_dispatch:   # 讓你可以在 Actions 分頁手動按一下測試
+    # GitHub 的時間是 UTC。下面 00:30 UTC = 台北早上 08:30。
+    # 想改時間就改這行的「分 時」，例如想台北 07:00 就寫 "0 23 * * *"（前一天 23:00 UTC）。
+    - cron: "30 0 * * *"
+  workflow_dispatch:        # 讓你可以在網頁上按按鈕手動觸發
+
+permissions:
+  contents: write           # 允許把 sent_state.json commit 回 repo（跨日去重要用）
 
 jobs:
   digest:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
-      - run: pip install requests
+      - name: Install deps
+        run: pip install requests
 
       - name: Run digest
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python daily_news.py
+        run: python news_digest.py        # ← 若你的檔名不是 news_digest.py，改這裡
+
+      - name: Persist dedup state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add sent_state.json
+          git diff --cached --quiet || git commit -m "chore: dedup state ${{ github.run_id }}"
+          git push || true
