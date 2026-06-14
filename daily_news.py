@@ -2,12 +2,12 @@
 每日另類資產新聞彙整 → 推送到 Telegram
 架構：Google News RSS 抓新聞 → Claude 過濾+摘要 → Python 注入網址 → Telegram
 
-本版相對舊版的改動：
-- 截斷修正：不再讓 Claude 抄那串超長 base64 網址（會吃光 max_tokens 導致輸出被切斷）。
-  改成 Claude 只輸出 [[編號]] 標記，網址由 Python 依編號精準補回去。
-- 跨日去重：用 sent_state.json 記錄「真的發出去過」的新聞，之後不再重發；保留 7 天後自動清掉。
-- 硬性 48 小時：除了 RSS 的 when:2d，再解析 pubDate 精確過濾一次。
-- 送出切塊改成「依段落為界」，網址不會在兩則訊息間被切斷。
+本版相對上一版的改動（共 3 處）：
+- 【召回率】QUERIES 新增廣撈關鍵字 "Brookfield"，補抓標題措辭鬆散
+  （例：「Renewable Energy Deal with Brookfield」）的交易新聞。
+- 【顯示】inject_links 改成：同一則新聞若併了多個來源，只顯示第一個網址，
+  但其餘來源照樣記為「已發送」，畫面清爽且跨日去重仍完整。
+- 【提示】prompt 配合說明：同一則新聞可把多個來源編號連在一起放。
 
 由 GitHub Actions 在雲端定時觸發。需要的環境變數（GitHub repo Secrets）：
   ANTHROPIC_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
@@ -37,11 +37,12 @@ TODAY = datetime.datetime.now(TAIPEI).strftime("%Y-%m-%d")
 # ── 去重 / 新鮮度設定 ────────────────────────────────────────
 STATE_FILE = Path("sent_state.json")  # 跨日去重狀態（會被 Actions commit 回 repo）
 DEDUP_DAYS = 7                        # 已發送紀錄保留天數，超過就清掉
-FRESH_HOURS = 48                      # 只發布近 48 小時內的新聞
+FRESH_HOURS = 48                      # 只發布近 48 小時內的新聞（想抓更舊就改 72，WINDOW 也要一起改）
 
 # ── 發現層設定 ──────────────────────────────────────────────
 QUERIES = [
-    # Brookfield 生態系（拆細，避免互相蓋掉）
+    # Brookfield 生態系
+    "Brookfield",                      # ★廣撈：標題有 Brookfield 就抓，補捉鬆散措辭的交易
     "Brookfield Corporation",
     "Brookfield Asset Management",
     "Brookfield Infrastructure",
@@ -65,7 +66,7 @@ QUERIES = [
     "commercial real estate distress",
 ]
 
-WINDOW = "when:2d"
+WINDOW = "when:2d"   # 想放寬成 72 小時就改 "when:3d"（並把上面 FRESH_HOURS 改 72）
 MAX_ITEMS = 70
 GL = "US"
 
@@ -77,7 +78,6 @@ def news_key(title: str) -> str:
 
 
 def load_state() -> dict:
-    """讀取已發送紀錄 {key: 'YYYY-MM-DD'}。檔案不存在或壞掉就回空 dict。"""
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text("utf-8"))
@@ -87,16 +87,14 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
-    """寫回紀錄，順便清掉超過 DEDUP_DAYS 天的舊資料，避免檔案無限長大。"""
     cutoff = (
         datetime.datetime.now(TAIPEI) - datetime.timedelta(days=DEDUP_DAYS)
     ).strftime("%Y-%m-%d")
-    pruned = {k: v for k, v in state.items() if v >= cutoff}  # 日期字串可直接比大小
+    pruned = {k: v for k, v in state.items() if v >= cutoff}
     STATE_FILE.write_text(json.dumps(pruned, ensure_ascii=False), "utf-8")
 
 
 def is_fresh(pub: str, hours: int = FRESH_HOURS) -> bool:
-    """解析 RFC822 pubDate，精確過濾 48 小時。解析失敗就放行交給 Claude 判斷。"""
     if not pub:
         return True
     try:
@@ -158,7 +156,6 @@ def collect(sent_state: dict) -> list:
 
 # ── 推理層（Claude 摘要，不抄網址）──────────────────────────────
 def build_news_block(items: list) -> str:
-    """給 Claude 的清單。不放 link：網址對判斷無用，且會浪費 token。"""
     lines = []
     for i, it in enumerate(items, 1):
         lines.append(
@@ -184,9 +181,10 @@ def build_prompt(news_block: str) -> str:
 
 【重要】網址處理：
 - 不要自己貼任何網址，也不要寫發布時間，這些我會用程式自動補上。
-- 在每則摘要的最後，只放一個對應標記 [[編號]]，編號就是上面清單該則開頭 [數字] 的數字。
-  例如你採用了清單第 7 則，就在那則摘要結尾寫 [[7]]。
-- 一則新聞對應一個標記，不要漏標也不要亂標。
+- 在每則摘要的最後放對應標記 [[編號]]，編號就是上面清單該則開頭 [數字] 的數字。
+- 如果你把好幾條清單併成「同一則新聞」，就把它們的編號全部「連在一起」放在那段結尾，
+  例如 [[1]][[5]][[8]]。我只會顯示第一個網址，但會把全部來源記錄起來，避免之後重複推送。
+- 不同的新聞要分開，不要亂標。
 
 輸出格式：純文字，適合在 Telegram 閱讀。每則之間空一行（一個空白行）。
 開頭寫上日期。整體長度盡量控制在 2500 字以內。
@@ -205,7 +203,7 @@ def summarize(news_block: str) -> str:
         },
         json={
             "model": "claude-sonnet-4-6",
-            "max_tokens": 4000,  # 拉高當安全邊際；網址已不由 Claude 輸出，實際用量也降很多
+            "max_tokens": 4000,
             "messages": [{"role": "user", "content": build_prompt(news_block)}],
         },
         timeout=300,
@@ -219,18 +217,26 @@ def summarize(news_block: str) -> str:
 
 
 def inject_links(digest: str, items: list):
-    """把 Claude 輸出的 [[編號]] 換成真網址＋發布時間；同時回傳「實際發出去」的 key。"""
+    """把 [[編號]] 換成網址。同一段若連續標了多個來源（同一則新聞的多個出處），
+    只顯示第一個網址，但全部都記為『已發送』，畫面清爽且跨日去重完整。"""
     idx = {str(i): it for i, it in enumerate(items, 1)}
     sent_keys = set()
 
-    def repl(m):
-        it = idx.get(m.group(1))
-        if not it:                       # 編號不存在（Claude 標錯）就清掉標記
-            return ""
-        sent_keys.add(it["key"])
-        return f"\n{it['link']}\n🕐 {it['pubDate']}"
+    run = re.compile(r"\[\[\d+\]\](?:\s*\[\[\d+\]\])*")  # 一串相鄰的標記
 
-    text = re.sub(r"\[\[(\d+)\]\]", repl, digest)
+    def repl(m):
+        nums = re.findall(r"\[\[(\d+)\]\]", m.group(0))
+        shown = ""
+        for n in nums:
+            it = idx.get(n)
+            if not it:
+                continue
+            sent_keys.add(it["key"])      # 全部記為已發送（去重用）
+            if not shown:                  # 只顯示第一個網址
+                shown = f"\n{it['link']}\n🕐 {it['pubDate']}"
+        return shown
+
+    text = run.sub(repl, digest)
     return text, sent_keys
 
 
@@ -246,9 +252,9 @@ def send_telegram(text: str) -> None:
         else:
             if cur:
                 chunks.append(cur)
-            if len(b) <= LIMIT:          # 換新塊放這段
+            if len(b) <= LIMIT:
                 cur = b
-            else:                        # 單段就超長（極少見）才硬切
+            else:
                 for j in range(0, len(b), LIMIT):
                     chunks.append(b[j : j + LIMIT])
                 cur = ""
@@ -276,15 +282,13 @@ if __name__ == "__main__":
 
         if not items:
             send_telegram(f"📅 {TODAY}\n今日近 48 小時內沒有新的（未發送過的）新聞。")
-            save_state(sent_state)  # 仍寫回一次，順便清掉過期紀錄
+            save_state(sent_state)
             sys.exit(0)
 
         digest = summarize(build_news_block(items))
         final_text, sent_keys = inject_links(digest, items)
         send_telegram(final_text)
 
-        # 只把「今天真的發出去的」標記為已發送，下次不再重發；
-        # 被 Claude 過濾掉的不算，明天若變重要仍可再出現。
         for k in sent_keys:
             sent_state[k] = TODAY
         save_state(sent_state)
