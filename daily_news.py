@@ -47,9 +47,6 @@ QUERIES = [
     "Blackstone",
     "Partners Group",
     "Ares Management",
-    "EQT AB",
-    "CVC Capital Partners",
-    "Carlyle Group",
     "Blue Owl Capital",
     "Oaktree Capital",
     # 管理階層 & 總經
