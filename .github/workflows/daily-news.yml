@@ -30,7 +30,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python news_digest.py        # ← 若你的檔名不是 news_digest.py，改這裡
+        run: python daily_news.py        # ← 若你的檔名不是 news_digest.py，改這裡
 
       - name: Persist dedup state
         run: |
