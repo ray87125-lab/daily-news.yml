@@ -2,12 +2,20 @@
 每日另類資產新聞彙整 → 推送到 Telegram
 架構：Google News RSS 抓新聞 → Claude 過濾+摘要 → Python 注入網址 → Telegram
 
-本版相對上一版的改動（共 3 處）：
-- 【召回率】QUERIES 新增廣撈關鍵字 "Brookfield"，補抓標題措辭鬆散
-  （例：「Renewable Energy Deal with Brookfield」）的交易新聞。
-- 【顯示】inject_links 改成：同一則新聞若併了多個來源，只顯示第一個網址，
-  但其餘來源照樣記為「已發送」，畫面清爽且跨日去重仍完整。
-- 【提示】prompt 配合說明：同一則新聞可把多個來源編號連在一起放。
+本版相對上一版的改動（共 6 處，重點都在「擋掉轉載舊聞」）：
+- 【新鮮度・改 fail-closed】is_fresh 由「無法判斷就放行」改成「無法判斷就丟」。
+  沒有 pubDate、解析失敗、或時間在未來，一律當成不新鮮 → 丟掉。
+  （嚴格兩天制：寧可錯殺無日期的，不要放行舊聞。）
+- 【來源黑名單】新增 BLOCKED_SOURCES：用 RSS 的 <source> 名稱比對，
+  擋掉轉載站／內容農場。上次回鍋 Carney 舊聞的 todayville 已預設放進去。
+  （這是真正能擋住「轉載舊文拿到新時間戳」的那一層。）
+- 【主題黑名單・預設關閉】新增 BLOCKED_TITLE_PATTERNS：標題含特定字就丟。
+  預設為空，附上範例，你要不要擋政治人物個人爭議自己決定（見下方說明）。
+- 【去重 key 修正】news_key 先去掉 Google News 慣性加在結尾的「 - 來源名」，
+  讓同一則新聞在不同來源也能對到同一個 key，跨來源去重更準。
+- 【單一來源上限】新增 MAX_PER_SOURCE：避免單一媒體洗版。
+- 【提示強化】prompt 多一條：提醒清單上的「時間」可能是轉載時間戳，
+  若標題明顯在講「已發生一段時間的事件」要保守當舊聞略過。
 
 由 GitHub Actions 在雲端定時觸發。需要的環境變數（GitHub repo Secrets）：
   ANTHROPIC_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
@@ -24,6 +32,7 @@ import email.utils
 import urllib.parse
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from collections import Counter
 
 import requests
 
@@ -37,7 +46,28 @@ TODAY = datetime.datetime.now(TAIPEI).strftime("%Y-%m-%d")
 # ── 去重 / 新鮮度設定 ────────────────────────────────────────
 STATE_FILE = Path("sent_state.json")  # 跨日去重狀態（會被 Actions commit 回 repo）
 DEDUP_DAYS = 7                        # 已發送紀錄保留天數，超過就清掉
-FRESH_HOURS = 48                      # 只發布近 48 小時內的新聞（想抓更舊就改 72，WINDOW 也要一起改）
+FRESH_HOURS = 48                      # 只發布近 48 小時內的新聞（兩天制；改 72 時 WINDOW 也要一起改）
+
+# ── 來源 / 主題過濾（新增）──────────────────────────────────
+# 已知的轉載站 / 內容農場 / 低訊號來源：用 RSS 的 <source> 名稱比對（不分大小寫、部分比對即可）。
+# 這一層才是真正能擋住「舊文被轉載後拿到新時間戳」的防線——時間過濾擋不了它。
+BLOCKED_SOURCES = {
+    "todayville",        # ← 上次把 4 月的 Carney 道德委員會舊聞回鍋的轉載站
+    # "rebel news",      # 想擋再自己加；維持中立，要不要擋由你決定
+    # "probe international",
+}
+
+# 標題含這些字（不分大小寫、部分比對）就丟掉。
+# 預設「空集合」= 不啟用，因為這類新聞對 BN 持股人其實可能是監管/政治風險訊號。
+# 如果你確定不想再收到「卡尼個人爭議」這類非公司營運新聞，就把下面幾行的註解拿掉。
+BLOCKED_TITLE_PATTERNS = {
+    # "carney",
+    # "blind trust",
+    # "ethics committee",
+    # "conflict of interest",
+}
+
+MAX_PER_SOURCE = 6   # 單一來源（媒體）每次最多收幾則，避免洗版；設 0 或 None 取消限制
 
 # ── 發現層設定 ──────────────────────────────────────────────
 QUERIES = [
@@ -73,8 +103,11 @@ GL = "US"
 
 # ── 工具函式：去重 key / 狀態存取 / 新鮮度 ──────────────────────
 def news_key(title: str) -> str:
-    """用標題正規化後的前 80 字當去重 key（不同 feed 會撈到同一則）。"""
-    return " ".join(title.lower().split())[:80]
+    """用標題正規化後的前 80 字當去重 key（不同 feed 會撈到同一則）。
+    先去掉 Google News 慣性加在結尾的「 - 來源名 / | 來源名」，
+    讓同一則新聞在不同來源也能對到同一個 key，跨來源去重才準。"""
+    t = re.sub(r"\s+[\-\–\—\|]\s+[^\-\–\—\|]+$", "", title or "")
+    return " ".join(t.lower().split())[:80]
 
 
 def load_state() -> dict:
@@ -95,16 +128,33 @@ def save_state(state: dict) -> None:
 
 
 def is_fresh(pub: str, hours: int = FRESH_HOURS) -> bool:
+    """嚴格兩天制：無法確認是 48 小時內的，一律當成不新鮮（fail-closed）。
+    這樣沒有 pubDate、解析失敗、或時間異常（未來）的項目都會被擋下。"""
     if not pub:
-        return True
+        return False                       # 沒有時間 = 無法驗證 → 丟
     try:
         dt = email.utils.parsedate_to_datetime(pub)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=datetime.timezone.utc)
-        age = datetime.datetime.now(datetime.timezone.utc) - dt
+        now = datetime.datetime.now(datetime.timezone.utc)
+        age = now - dt
+        if age < datetime.timedelta(0):    # 時間在未來 = 異常 → 丟
+            return False
         return age <= datetime.timedelta(hours=hours)
     except Exception:
-        return True
+        return False                       # 解析失敗 = 無法驗證 → 丟
+
+
+def is_blocked_source(src: str) -> bool:
+    s = (src or "").lower()
+    return any(b in s for b in BLOCKED_SOURCES)
+
+
+def is_blocked_title(title: str) -> bool:
+    if not BLOCKED_TITLE_PATTERNS:
+        return False
+    t = (title or "").lower()
+    return any(p in t for p in BLOCKED_TITLE_PATTERNS)
 
 
 # ── 發現層 ─────────────────────────────────────────────────
@@ -135,19 +185,28 @@ def fetch_rss(query: str) -> list:
 
 
 def collect(sent_state: dict) -> list:
-    """跑完所有關鍵字，套用：同次去重 + 跨日去重 + 48 小時過濾。"""
+    """跑完所有關鍵字，套用：來源/主題黑名單 + 同次去重 + 跨日去重 + 48 小時過濾 + 單一來源上限。"""
     seen = set()
+    per_source = Counter()
     out = []
     for q in QUERIES:
         for it in fetch_rss(q):
-            key = news_key(it["title"])
+            title, src = it["title"], it["source"]
+            key = news_key(title)
             if not key or key in seen:
+                continue
+            # 黑名單放在 seen.add 之前：被擋掉的版本不佔用 key，
+            # 讓同一則新聞的「乾淨來源版本」之後還有機會被收錄。
+            if is_blocked_source(src) or is_blocked_title(title):
                 continue
             seen.add(key)
             if key in sent_state:            # 跨日去重：之前已發送過就跳過
                 continue
-            if not is_fresh(it["pubDate"]):  # 硬性 48 小時
+            if not is_fresh(it["pubDate"]):  # 硬性 48 小時（fail-closed）
                 continue
+            if MAX_PER_SOURCE and per_source[src.lower()] >= MAX_PER_SOURCE:
+                continue                     # 單一來源洗版上限
+            per_source[src.lower()] += 1
             it["key"] = key
             out.append(it)
         time.sleep(0.5)
@@ -177,7 +236,11 @@ def build_prompt(news_block: str) -> str:
    併購與重組案進度、評等與展望變動、配息/回購政策、旗艦基金募資與贖回（gate）動態、
    管理階層（如 Bruce Flatt、Howard Marks）發言或合作。
 6. 沒有重大新聞的板塊直接略過，不要硬湊。若清單裡確實沒有重要的，就誠實說「今日無重大新聞」。
-7. 結尾給一句「今日板塊情緒：偏多／中性／偏空」並簡述理由。
+7. 【重要・防回鍋舊聞】清單上的「時間」是 Google News 的索引/轉載時間，
+   有可能是「舊聞被轉載後拿到的新時間戳」。若標題明顯在講一件「已經發生一段時間的事」
+   （例如某委員會報告、某訴訟判決、某人就任、某已定案的政策），而且讀起來不像是
+   「最新進度更新」，請保守地當成舊聞略過或大幅降權，不要當成今日新聞推給我。
+8. 結尾給一句「今日板塊情緒：偏多／中性／偏空」並簡述理由。
 
 【重要】網址處理：
 - 不要自己貼任何網址，也不要寫發布時間，這些我會用程式自動補上。
@@ -278,7 +341,7 @@ if __name__ == "__main__":
     try:
         sent_state = load_state()
         items = collect(sent_state)
-        print(f"抓到 {len(items)} 則（跨日去重 + 48h 過濾後）", file=sys.stderr)
+        print(f"抓到 {len(items)} 則（來源/主題過濾 + 跨日去重 + 48h fail-closed 後）", file=sys.stderr)
 
         if not items:
             send_telegram(f"📅 {TODAY}\n今日近 48 小時內沒有新的（未發送過的）新聞。")
