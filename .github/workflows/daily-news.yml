@@ -1,14 +1,24 @@
+# .github/workflows/daily_news.yml
+# 整支直接覆蓋你現有的 workflow 即可。重點修了兩件事：
+#   1) concurrency：同一時間只跑一個，第二次觸發會排隊等 → 解決「兩個 run 撞在一起各送一次」的重複。
+#   2) Persist 步驟：先 pull --rebase 再 push，且不再用「|| true」吞掉錯誤 → state 一定存得回去，失敗會明確報錯。
+
 name: Daily News Digest
 
 on:
   schedule:
-    # GitHub 的時間是 UTC。下面 00:30 UTC = 台北早上 08:30。
-    # 想改時間就改這行的「分 時」，例如想台北 07:00 就寫 "0 23 * * *"（前一天 23:00 UTC）。
+    # GitHub 用 UTC。00:30 UTC = 台北 08:30。想台北 07:00 就改 "0 23 * * *"。
     - cron: "30 0 * * *"
-  workflow_dispatch:        # 讓你可以在網頁上按按鈕手動觸發
+  workflow_dispatch:        # 允許在網頁手動觸發
 
 permissions:
   contents: write           # 允許把 sent_state.json commit 回 repo（跨日去重要用）
+
+# 同一時間只允許一個 run；第二次觸發會「排隊等」前一個跑完並存好 state 才起跑。
+# cancel-in-progress: false → 不要中途砍掉前一個，否則它還沒 commit 就被殺，state 又會掉。
+concurrency:
+  group: daily-news-digest
+  cancel-in-progress: false
 
 jobs:
   digest:
@@ -30,12 +40,19 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python daily_news.py        # ← 若你的檔名不是 news_digest.py，改這裡
+        run: python daily_news.py        # ← 你的腳本檔名；若改名了這裡也要一起改
 
       - name: Persist dedup state
+        if: always()                      # 即使前面有狀況也嘗試保存（沒變更會自動跳過）
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          [ -f sent_state.json ] || { echo "no state file, skip"; exit 0; }
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add sent_state.json
-          git diff --cached --quiet || git commit -m "chore: dedup state ${{ github.run_id }}"
-          git push || true
+          if git diff --cached --quiet; then
+            echo "state unchanged, nothing to commit"
+            exit 0
+          fi
+          git commit -m "chore: dedup state ${{ github.run_id }}"
+          git pull --rebase --autostash   # 先把遠端最新狀態 rebase 進來，避免 non-fast-forward
+          git push                          # 不再 || true：push 失敗就讓它紅，才看得到問題
