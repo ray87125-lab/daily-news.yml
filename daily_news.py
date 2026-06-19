@@ -4,23 +4,22 @@
 
 本版重點改動：
 - 【噪音硬刪】NOISE_TITLE_PATTERNS：原告律所樣板稿（shareholder alert / class action / 各家律所名）
-  與例行 13F／持倉增減披露（trims holdings、shares sold by、$X million position…），
-  在送進 Claude 之前就用標題樣式刪掉，Claude 根本看不到，保證不出現。
-- 【跨次語意去重】把過去 DEDUP_DAYS 天「已發過的標題」餵給 Claude，要求它把
-  「同一件事、不同文章/來源/用字」的新聞一律不再報。純比對標題抓不到，只能靠語意。
-  → sent_state 改存 {key: {"d": 日期, "t": 標題}}，才有歷史標題可餵。
-- 【準確性】prompt 硬性規定：只能寫標題明確出現的事實與數字，沒有的代號/金額/EPS 不准杜撰。
-
-── 2026-06 修正（本檔）───────────────────────────────────────
-- 【不准腦補敘事】摘要長度改成「由標題資訊量決定」，一句話的標題就一句話帶過，
-  禁止對比喻/並列式標題（如 "X reaches for orbit as Y heads for the exit"）編造因果或對比。
-- 【只輸出成品】prompt 明令不准解釋去重/過濾過程；strip_meta_commentary() 為送出前的安全網。
+  與例行 13F／持倉增減披露，在送進 Claude 之前就用標題樣式刪掉。
+- 【撞名硬刪】IRRELEVANT_TITLE_PATTERNS：Brookfield 這個地名/小鎮/房產/學校（伊利諾、威斯康辛、
+  Brookfield Center…）與我的持股無關，直接刪掉，避免關鍵字撞名誤判。
+- 【跨次語意去重】把過去 DEDUP_DAYS 天「已發過的標題」餵給 Claude 做語意去重。
+  → recent_sent_titles limit 提高到 200，避免某一件事（如 Multiplex）的多個變體標題把
+    去重窗口吃光，導致前一兩天發過的別件新聞（如 Csquare）漏掉、被重報。
+  → sent_state 存 {key: {"d": 日期, "t": 標題}}。
+- 【準確性 / 不准腦補敘事】prompt 硬性規定：只寫標題明確出現的事實；摘要長度由標題資訊量決定；
+  比喻/並列式標題不准編造因果或對比；摘要內文不准寫來源網域名。
+- 【只輸出成品】prompt 明令不准解釋去重/過濾過程；strip_meta_commentary() 為送出前安全網。
 - 【觀點來源】OPINION_SOURCES：Seeking Alpha / Motley Fool / Simply Wall St 等分析稿標記
   ［觀點來源］，prompt 要求降級為【觀點】或直接略過。
-- 【真正修死連結】resolve_link()：改用 Google News 內部 batchexecute 端點還原加密轉址，
-  舊版「跟 redirect」對現在的 /articles/CBMi… 已失效（會全部退回搜尋連結）。
+- 【修死連結】resolve_link()：用 googlenewsdecoder 還原 Google News 加密轉址；失敗退回搜尋連結。
 
 由 GitHub Actions 觸發。環境變數（repo Secrets）：ANTHROPIC_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+依賴：pip install requests googlenewsdecoder
 workflow 需 `permissions: contents: write` + `concurrency:` + 跑完 commit/push sent_state.json。
 """
 
@@ -37,6 +36,7 @@ from pathlib import Path
 from collections import Counter
 
 import requests
+from googlenewsdecoder import gnewsdecoder
 
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -51,13 +51,16 @@ DEDUP_DAYS = 7
 FRESH_HOURS = 48
 RESOLVE_LINKS = True          # 是否把 Google 加密轉址還原成真網址（False 則直接用原連結）
 
-# ── 來源黑名單（轉載站 / 內容農場）─────────────────────────────
+# ── 來源黑名單（轉載站 / 內容農場 / 地方小報）────────────────────
 BLOCKED_SOURCES = {
     "todayville",
     # MarketBeat 系內容農場（13F 持倉稿的大宗來源；標題樣式也會擋，這裡是雙保險）
     "marketbeat", "etf daily news", "defense world", "tickerreport", "ticker report",
     "modern readers", "american banking news", "dakota financial news",
     "the cerbat gem", "transcript daily", "watch list news", "zolmax",
+    # Brookfield 同名小鎮（伊利諾/威斯康辛）的地方/體育小報
+    "riverside-brookfield landmark", "maxpreps", "patch", "gmtoday",
+    "wisn", "wbal-tv", "dailyvoice",
     # "rebel news",   # 政治立場類要不要擋自己決定
 }
 
@@ -90,6 +93,15 @@ NOISE_TITLE_PATTERNS = {
     "sells shares of", "buys shares of", "purchases shares of",
     "million position in", "million stake in", "million holdings in",
     "position lifted", "position raised", "position trimmed", "position boosted",
+}
+
+# ── 撞名硬刪（Brookfield 作為地名/小鎮/房產/學校，與持股無關）──────────
+IRRELEVANT_TITLE_PATTERNS = {
+    "brookfield center", "riverside-brookfield", "town of brookfield",
+    "village of brookfield", "brookfield central", "brookfield east",
+    "brookfield zoo", "brookfield high", "brookfield fireworks",
+    "brookfield dispensary", "brookfield shops", "brookfield, il",
+    "brookfield, wi", "brookfield, wisconsin", "brookfield, illinois",
 }
 
 # ── 主題黑名單（預設關閉；政治人物個人爭議要不要擋自己決定）─────────
@@ -162,8 +174,10 @@ def save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(pruned, ensure_ascii=False), "utf-8")
 
 
-def recent_sent_titles(state: dict, days: int = DEDUP_DAYS, limit: int = 50) -> list:
-    """近 N 天已發送過的標題（近的在前），給 Claude 做跨次語意去重用。"""
+def recent_sent_titles(state: dict, days: int = DEDUP_DAYS, limit: int = 200) -> list:
+    """近 N 天已發送過的標題（近的在前），給 Claude 做跨次語意去重用。
+    limit 拉高到 200：避免單一事件（如 Multiplex）的多個變體標題把窗口吃光，
+    害前一兩天發過的別件新聞（如 Csquare）掉出清單而被重報。"""
     cutoff = (
         datetime.datetime.now(TAIPEI) - datetime.timedelta(days=days)
     ).strftime("%Y-%m-%d")
@@ -206,6 +220,11 @@ def is_noise_title(title: str) -> bool:
     return any(p in t for p in NOISE_TITLE_PATTERNS)
 
 
+def is_irrelevant_title(title: str) -> bool:
+    t = (title or "").lower()
+    return any(p in t for p in IRRELEVANT_TITLE_PATTERNS)
+
+
 def is_blocked_title(title: str) -> bool:
     if not BLOCKED_TITLE_PATTERNS:
         return False
@@ -241,7 +260,7 @@ def fetch_rss(query: str) -> list:
 
 
 def collect(sent_state: dict) -> list:
-    """來源/噪音/主題過濾 → 同次去重 → 跨日(精確)去重 → 48h fail-closed → 單一來源上限。"""
+    """來源/噪音/撞名/主題過濾 → 同次去重 → 跨日(精確)去重 → 48h fail-closed → 單一來源上限。"""
     seen = set()
     per_source = Counter()
     out = []
@@ -251,8 +270,13 @@ def collect(sent_state: dict) -> list:
             key = news_key(title)
             if not key or key in seen:
                 continue
-            # 噪音/黑名單放在 seen.add 之前：被擋的不佔 key，乾淨版本還有機會被收。
-            if is_blocked_source(src) or is_noise_title(title) or is_blocked_title(title):
+            # 噪音/黑名單/撞名放在 seen.add 之前：被擋的不佔 key，乾淨版本還有機會被收。
+            if (
+                is_blocked_source(src)
+                or is_noise_title(title)
+                or is_irrelevant_title(title)
+                or is_blocked_title(title)
+            ):
                 continue
             seen.add(key)
             if key in sent_state:            # 跨日精確去重
@@ -318,6 +342,7 @@ def build_prompt(news_block: str, recent_block: str) -> str:
 
 【網址處理】
 - 不要自己貼網址或寫時間，這些我會用程式補上。
+- 摘要內文不要寫出來源網域名（例如 thedeal.com、marketscreener.com），那是給程式用的，寫進內文會被自動連結化弄壞。
 - 每則摘要最後放對應標記 [[編號]]，編號就是清單該則開頭 [數字] 的數字。
 - 多則併成同一則時，把編號全部相連放結尾，例如 [[1]][[5]][[8]]；不同新聞要分開。
 
@@ -372,53 +397,13 @@ def strip_meta_commentary(text: str) -> str:
 
 
 # ── 連結還原（修死連結）─────────────────────────────────────
-def _gnews_decode(article_url: str):
-    """把 Google News 的 /articles/CBMi… 加密轉址還原成真實文章網址。
-    用 Google 內部 batchexecute 端點，不需額外套件。失敗回 None。
-
-    註：這支打的是 Google 未公開端點，格式 Google 偶爾會改。
-    若哪天整批失效，最省事的替代方案是 `pip install googlenewsdecoder`，
-    把本函式換成 gnewsdecoder(article_url)["decoded_url"] 即可。"""
+def _gnews_decode(article_url):
+    """用維護中的 googlenewsdecoder 還原 Google News 加密轉址。失敗回 None。
+    若哪天整批失效，先 `pip install -U googlenewsdecoder` 升級；通常它會跟上 Google 的格式變動。"""
     try:
-        m = re.search(r"/(?:rss/)?articles/([^?/]+)", article_url)
-        if not m:
-            return None
-        art_id = m.group(1)
-
-        # 1) 抓 article 頁，取 signature / timestamp
-        page = requests.get(
-            f"https://news.google.com/articles/{art_id}",
-            timeout=10, headers={"User-Agent": "Mozilla/5.0"},
-        )
-        page.raise_for_status()
-        sig = re.search(r'data-n-a-sg="([^"]+)"', page.text)
-        ts = re.search(r'data-n-a-ts="([^"]+)"', page.text)
-        if not (sig and ts):
-            return None
-        signature, timestamp = sig.group(1), ts.group(1)
-
-        # 2) POST batchexecute 還原
-        inner = (
-            '["garturlreq",[["X","X",["X","X"],null,null,1,1,"US:en",null,1,'
-            'null,null,null,null,null,0,1],"X","X",1,[1,1,1],1,1,null,0,0,null,0],'
-            f'"{art_id}",{int(timestamp)},"{signature}"]'
-        )
-        freq = json.dumps([[["Fbv4je", inner, None, "generic"]]])
-        r = requests.post(
-            "https://news.google.com/_/DotsSplashUi/data/batchexecute",
-            data={"f.req": freq},
-            headers={
-                "User-Agent": "Mozilla/5.0",
-                "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-            },
-            timeout=10,
-        )
-        r.raise_for_status()
-        # 回應是 )]}' 開頭的分段文字，含 garturlres 的那段才是答案
-        parsed = json.loads(r.text.split("\n\n")[1])[:-2]
-        url = json.loads(parsed[0][2])[1]
-        if url and url.startswith("http"):
-            return url
+        res = gnewsdecoder(article_url, interval=1)
+        if res.get("status") and str(res.get("decoded_url", "")).startswith("http"):
+            return res["decoded_url"]
     except Exception:
         return None
     return None
@@ -429,8 +414,8 @@ def resolve_link(google_link: str, title: str) -> str:
     if not RESOLVE_LINKS:
         return google_link
 
-    # 1) Google News 加密連結：用 batchexecute 解碼
-    if "news.google.com" in google_link and "/articles/" in google_link:
+    # 1) Google News 加密連結：用 googlenewsdecoder 解碼
+    if "news.google.com" in google_link:
         real = _gnews_decode(google_link)
         if real:
             return real
@@ -508,7 +493,7 @@ if __name__ == "__main__":
     try:
         sent_state = load_state()
         items = collect(sent_state)
-        print(f"抓到 {len(items)} 則（噪音/來源過濾 + 精確去重 + 48h 後）", file=sys.stderr)
+        print(f"抓到 {len(items)} 則（噪音/來源/撞名過濾 + 精確去重 + 48h 後）", file=sys.stderr)
 
         if not items:
             send_telegram(f"📅 {TODAY}\n今日近 48 小時內沒有新的（未發送過的）新聞。")
