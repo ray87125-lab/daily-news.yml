@@ -9,10 +9,16 @@
 - 【跨次語意去重】把過去 DEDUP_DAYS 天「已發過的標題」餵給 Claude，要求它把
   「同一件事、不同文章/來源/用字」的新聞一律不再報。純比對標題抓不到，只能靠語意。
   → sent_state 改存 {key: {"d": 日期, "t": 標題}}，才有歷史標題可餵。
-- 【準確性】prompt 硬性規定：只能寫標題明確出現的事實與數字，沒有的代號/金額/EPS 不准杜撰
-  （直接堵掉先前「APO 子公司 APOS」這種捏造）。
-- 【修死連結】resolve_link()：把 Google News 的加密轉址盡量還原成真正文章網址；
-  還原不了就退回一個一定打得開的 Google News 搜尋連結，不再出現點了打不開的連結。
+- 【準確性】prompt 硬性規定：只能寫標題明確出現的事實與數字，沒有的代號/金額/EPS 不准杜撰。
+
+── 2026-06 修正（本檔）───────────────────────────────────────
+- 【不准腦補敘事】摘要長度改成「由標題資訊量決定」，一句話的標題就一句話帶過，
+  禁止對比喻/並列式標題（如 "X reaches for orbit as Y heads for the exit"）編造因果或對比。
+- 【只輸出成品】prompt 明令不准解釋去重/過濾過程；strip_meta_commentary() 為送出前的安全網。
+- 【觀點來源】OPINION_SOURCES：Seeking Alpha / Motley Fool / Simply Wall St 等分析稿標記
+  ［觀點來源］，prompt 要求降級為【觀點】或直接略過。
+- 【真正修死連結】resolve_link()：改用 Google News 內部 batchexecute 端點還原加密轉址，
+  舊版「跟 redirect」對現在的 /articles/CBMi… 已失效（會全部退回搜尋連結）。
 
 由 GitHub Actions 觸發。環境變數（repo Secrets）：ANTHROPIC_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 workflow 需 `permissions: contents: write` + `concurrency:` + 跑完 commit/push sent_state.json。
@@ -55,6 +61,13 @@ BLOCKED_SOURCES = {
     # "rebel news",   # 政治立場類要不要擋自己決定
 }
 
+# ── 觀點 / 分析來源（不擋，但標記後交給 Claude 降級或略過）──────────
+OPINION_SOURCES = {
+    "seeking alpha", "motley fool", "simply wall st", "simplywall",
+    "kalkine", "gurufocus", "traders union", "marketsmojo", "tipranks",
+    "zacks", "investorplace", "wealth awesome", "newsline", "stocktwits",
+}
+
 # ── 噪音標題樣式（永遠擋掉，送進 Claude 前就刪）───────────────────
 # 原則：只放「幾乎不帶實質資訊」的樣板措辭，避免誤殺真新聞（例如真正的併購入股不會被擋）。
 NOISE_TITLE_PATTERNS = {
@@ -83,6 +96,12 @@ NOISE_TITLE_PATTERNS = {
 BLOCKED_TITLE_PATTERNS = {
     # "carney", "blind trust", "ethics committee", "conflict of interest",
 }
+
+# ── 後設說明關鍵字（送出前安全網，剝掉 Claude 偶爾外洩的去重/過濾說明）──
+META_LINE_PATTERNS = (
+    "已於近期發送", "已多次發送", "全數略過", "無新增價值", "未重複已發送",
+    "近期發送清單", "已發送清單", "重複，全數", "以下為今日",
+)
 
 MAX_PER_SOURCE = 6
 
@@ -177,6 +196,11 @@ def is_blocked_source(src: str) -> bool:
     return any(b in s for b in BLOCKED_SOURCES)
 
 
+def is_opinion_source(src: str) -> bool:
+    s = (src or "").lower()
+    return any(o in s for o in OPINION_SOURCES)
+
+
 def is_noise_title(title: str) -> bool:
     t = (title or "").lower()
     return any(p in t for p in NOISE_TITLE_PATTERNS)
@@ -248,8 +272,9 @@ def collect(sent_state: dict) -> list:
 def build_news_block(items: list) -> str:
     lines = []
     for i, it in enumerate(items, 1):
+        tag = " ［觀點來源］" if is_opinion_source(it["source"]) else ""
         lines.append(
-            f"[{i}] 來源:{it['source']} | 時間:{it['pubDate']}\n"
+            f"[{i}] 來源:{it['source']}{tag} | 時間:{it['pubDate']}\n"
             f"    標題:{it['title']}"
         )
     return "\n".join(lines)
@@ -258,29 +283,38 @@ def build_news_block(items: list) -> str:
 def build_prompt(news_block: str, recent_block: str) -> str:
     return f"""今天是 {TODAY}（台北時間）。下面是我用 Google News RSS 在過去 2 天抓到的另類資產管理業新聞清單（含編號、來源、時間、標題）。
 
+【你只看得到標題，看不到內文——這點決定了下面所有規則】
+
 請你做的事：
 1. 只保留「真正重要」的新聞，過濾掉重複、無關、純股價波動、業配與舊聞。
 2. 對我的持股（BN／BIPC／BEPC／MQG／APO／KKR）有直接影響的放最前面，標記【持股】。
-3. 每則用 2-3 句繁體中文摘要，用自己的話寫，不要照抄原文。
-4. 優先呈報：實體資產出售、商用不動產壞帳/接管、併購與重組進度、評等與展望變動、
-   配息/回購政策、旗艦基金募資與贖回(gate)、管理階層(如 Bruce Flatt、Howard Marks)發言或合作。
+3. 摘要長度由標題實際資訊量決定：標題只講一件事，就用「一句話」照實複述；不要為了湊到 2-3 句而補上標題沒有的背景、動機、影響或解讀。只有標題本身就含多個事實時才寫到 2-3 句。寧可短，不要腦補。
+4. 優先呈報：實體資產出售、商用不動產壞帳/接管、併購與重組進度、評等與展望變動、配息/回購政策、旗艦基金募資與贖回(gate)、管理階層(如 Bruce Flatt、Howard Marks)發言或合作。
 5. 沒有重大新聞的板塊直接略過。若清單裡確實沒有重要的，就誠實說「今日無重大新聞」。
 6. 結尾給一句「今日板塊情緒：偏多／中性／偏空」並簡述理由。
 
-【避免重複・最重要】
-- 下面「近期已發送」是過去幾天已經報過的新聞標題。今天清單中若有任何一則，
-  和「近期已發送」其實是【同一件事】（同一筆交易／同一份財報／同一份報告／同一樁訴訟／
-  同一份 13F／同一個合作案），即使用字、角度、數字、來源不同，**一律不要再報**。
-- 今天清單內部若有多則其實是同一件事，**只挑資訊量最高的一則**報，其餘併入或捨棄。
+【不准腦補敘事・最重要】
+- 除了標題字面明確寫出的事實，一律不准推論：不准推測公司動機、策略意圖、對股價或估值的影響、與其他公司的比較或分歧、交易背後的原因。
+- 標題若是比喻、雙關或語意不明（例如「X reaches for orbit as Y heads for the exit」這種把兩件事並列的標題），只照字面說標題提到了什麼，絕對不要把兩件事連成因果、對比或「同一件事的兩面」，也不要自己編一個解釋。看不懂就只複述字面。
+- 標題沒有的金額、估值、股票代號、EPS 數字、人名，一律不准自己編；不確定的實體寧可說「未揭露」。
 
-【排除噪音・最重要】
-- 跳過原告律所的「股東警示／集體訴訟召集／investigation」樣板稿，除非有具體且重大的法律
-  進展（正式起訴、和解金額、法院裁定）。
-- 跳過例行 13F／持倉增減披露，除非是對「我的持股本身」具策略意義的重大變動。
+【只輸出成品，不要解釋過程・最重要】
+- 只輸出最後選出來要報的新聞。不要解釋你過濾了什麼、跳過了什麼、為什麼跳過、哪些和近期已發送重複。
+- 禁止出現這類句子：「以下為今日無新增價值的項目」「此筆已多次發送，全數略過」「（注：…已於近期發送清單中已報…）」「已發送過」「未重複已發送內容」。
+- 該略過的就靜默略過，連提都不要提；輸出裡不該有任何關於「去重／過濾／清單」的後設說明。
 
-【準確性・最重要】
-- 只寫標題明確出現的事實與數字；標題沒有的金額、估值、股票代號、EPS 數字，**一律不要自己編**。
-- 不確定的實體名稱或代號不要硬寫，寧可說「未揭露」也不要杜撰。
+【避免重複】
+- 下面「近期已發送」是過去幾天已報過的標題。今天清單若有一則和它其實是【同一件事】（同一筆交易／財報／報告／訴訟／13F／合作案），即使用字、角度、數字、來源不同，一律不要再報，也不要說明你略過了它。
+- 今天清單內部若有多則是同一件事，只挑資訊量最高的一則報，其餘靜默併入或捨棄。
+
+【觀點來源處理】
+- 標記［觀點來源］的是分析/評論稿（Seeking Alpha、Motley Fool、Simply Wall St 等），不是第一手新聞。
+- 這類只有在「提供了清單裡其他第一手新聞沒有、且具體的新事實」時才報；否則一律略過。
+- 若真要報，標記改用【觀點】（不要用【持股】），並寫明這是第三方分析。
+
+【排除噪音】
+- 跳過原告律所的「股東警示／集體訴訟召集／investigation」樣板稿，除非有具體且重大的法律進展（正式起訴、和解金額、法院裁定）。
+- 跳過例行 13F／持倉增減披露，除非對「我的持股本身」具策略意義。
 
 【網址處理】
 - 不要自己貼網址或寫時間，這些我會用程式補上。
@@ -319,12 +353,89 @@ def summarize(news_block: str, recent_block: str) -> str:
     return text.strip() or "（今日沒有產生內容）"
 
 
+def strip_meta_commentary(text: str) -> str:
+    """送出前安全網：即使 prompt 沒擋住，也剝掉去重/過濾的後設說明。
+    重點：含 [[編號]] 的行絕不動，以免影響 inject_links 的已發送記錄。"""
+    # 1) 去掉 （注：…）/（註：…）裡談到發送/重複/略過/清單的整段括號
+    text = re.sub(r"（\s*[注註][：:][^）]*(?:發送|重複|略過|清單)[^）]*）", "", text)
+    # 2) 逐行刪掉純後設說明的行（但保留任何含編號標記的行）
+    kept = []
+    for line in text.splitlines():
+        if "[[" in line:
+            kept.append(line)
+            continue
+        if any(p in line for p in META_LINE_PATTERNS):
+            continue
+        kept.append(line)
+    # 3) 壓掉因刪行產生的連續空行
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+
+
 # ── 連結還原（修死連結）─────────────────────────────────────
+def _gnews_decode(article_url: str):
+    """把 Google News 的 /articles/CBMi… 加密轉址還原成真實文章網址。
+    用 Google 內部 batchexecute 端點，不需額外套件。失敗回 None。
+
+    註：這支打的是 Google 未公開端點，格式 Google 偶爾會改。
+    若哪天整批失效，最省事的替代方案是 `pip install googlenewsdecoder`，
+    把本函式換成 gnewsdecoder(article_url)["decoded_url"] 即可。"""
+    try:
+        m = re.search(r"/(?:rss/)?articles/([^?/]+)", article_url)
+        if not m:
+            return None
+        art_id = m.group(1)
+
+        # 1) 抓 article 頁，取 signature / timestamp
+        page = requests.get(
+            f"https://news.google.com/articles/{art_id}",
+            timeout=10, headers={"User-Agent": "Mozilla/5.0"},
+        )
+        page.raise_for_status()
+        sig = re.search(r'data-n-a-sg="([^"]+)"', page.text)
+        ts = re.search(r'data-n-a-ts="([^"]+)"', page.text)
+        if not (sig and ts):
+            return None
+        signature, timestamp = sig.group(1), ts.group(1)
+
+        # 2) POST batchexecute 還原
+        inner = (
+            '["garturlreq",[["X","X",["X","X"],null,null,1,1,"US:en",null,1,'
+            'null,null,null,null,null,0,1],"X","X",1,[1,1,1],1,1,null,0,0,null,0],'
+            f'"{art_id}",{int(timestamp)},"{signature}"]'
+        )
+        freq = json.dumps([[["Fbv4je", inner, None, "generic"]]])
+        r = requests.post(
+            "https://news.google.com/_/DotsSplashUi/data/batchexecute",
+            data={"f.req": freq},
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            },
+            timeout=10,
+        )
+        r.raise_for_status()
+        # 回應是 )]}' 開頭的分段文字，含 garturlres 的那段才是答案
+        parsed = json.loads(r.text.split("\n\n")[1])[:-2]
+        url = json.loads(parsed[0][2])[1]
+        if url and url.startswith("http"):
+            return url
+    except Exception:
+        return None
+    return None
+
+
 def resolve_link(google_link: str, title: str) -> str:
-    """Google News 的 articles/CBMi... 是加密轉址，常常打不開。
-    先嘗試跟著轉址拿到真正文章網址；拿不到就退回一個一定打得開的 Google News 搜尋連結。"""
+    """先試 Google News 解碼 → 再試一般 redirect → 都不行才退回搜尋連結。"""
     if not RESOLVE_LINKS:
         return google_link
+
+    # 1) Google News 加密連結：用 batchexecute 解碼
+    if "news.google.com" in google_link and "/articles/" in google_link:
+        real = _gnews_decode(google_link)
+        if real:
+            return real
+
+    # 2) 一般轉址（非 Google News，或解碼失敗時再試一次跟轉址）
     try:
         r = requests.get(
             google_link, timeout=10, allow_redirects=True,
@@ -335,6 +446,8 @@ def resolve_link(google_link: str, title: str) -> str:
             return final
     except Exception:
         pass
+
+    # 3) 一定打得開的退路
     return "https://news.google.com/search?q=" + urllib.parse.quote(title or google_link)
 
 
@@ -404,6 +517,7 @@ if __name__ == "__main__":
 
         recent_block = "\n".join(f"- {t}" for t in recent_sent_titles(sent_state)) or "（無）"
         digest = summarize(build_news_block(items), recent_block)
+        digest = strip_meta_commentary(digest)          # 送出前剝掉殘留的後設說明
         final_text, sent_keys = inject_links(digest, items)
         send_telegram(final_text)
 
@@ -419,5 +533,5 @@ if __name__ == "__main__":
             send_telegram(f"⚠️ 今日新聞彙整失敗：{e}")
         except Exception:
             pass
-        print("Error:", e, file=sys.stderr)
-        sys.exit(1)
+        print(f"FATAL: {e}", file=sys.stderr)
+        sys.exit(1)   # 讓 GitHub Actions 把這次 run 標記成失敗
