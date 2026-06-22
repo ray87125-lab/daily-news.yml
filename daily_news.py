@@ -5,6 +5,8 @@
 本版重點改動：
 - 【噪音硬刪】NOISE_TITLE_PATTERNS：原告律所樣板稿（shareholder alert / class action / 各家律所名）
   與例行 13F／持倉增減披露，在送進 Claude 之前就用標題樣式刪掉。
+  ★本次新增：純股價波動 / 技術線型 / 每日漲跌 recap（stock price forecast、outperforms market、
+    % this week…）也在這層硬刪——prompt 雖已要求略過，但「Up 3% This Week」仍會漏進來，做雙保險。
 - 【撞名硬刪】IRRELEVANT_TITLE_PATTERNS：Brookfield 這個地名/小鎮/房產/學校（伊利諾、威斯康辛、
   Brookfield Center…）與我的持股無關，直接刪掉，避免關鍵字撞名誤判。
 - 【跨次語意去重】把過去 DEDUP_DAYS 天「已發過的標題」餵給 Claude 做語意去重。
@@ -16,6 +18,7 @@
 - 【只輸出成品】prompt 明令不准解釋去重/過濾過程；strip_meta_commentary() 為送出前安全網。
 - 【觀點來源】OPINION_SOURCES：Seeking Alpha / Motley Fool / Simply Wall St 等分析稿標記
   ［觀點來源］，prompt 要求降級為【觀點】或直接略過。
+  ★本次新增：kavout（演算法軟文）、ad hoc news（內容回收站）也納入降級。
 - 【修死連結】resolve_link()：用 googlenewsdecoder 還原 Google News 加密轉址；失敗退回搜尋連結。
 
 由 GitHub Actions 觸發。環境變數（repo Secrets）：ANTHROPIC_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
@@ -61,6 +64,8 @@ BLOCKED_SOURCES = {
     # Brookfield 同名小鎮（伊利諾/威斯康辛）的地方/體育小報
     "riverside-brookfield landmark", "maxpreps", "patch", "gmtoday",
     "wisn", "wbal-tv", "dailyvoice",
+    # 波蘭 3C/SEO 內容農場（反覆灌 Macquarie 股價波動稿，與持股無實質關聯）
+    "bez kabli", "bez-kabli", "bezkabli",
     # "rebel news",   # 政治立場類要不要擋自己決定
 }
 
@@ -69,6 +74,8 @@ OPINION_SOURCES = {
     "seeking alpha", "motley fool", "simply wall st", "simplywall",
     "kalkine", "gurufocus", "traders union", "marketsmojo", "tipranks",
     "zacks", "investorplace", "wealth awesome", "newsline", "stocktwits",
+    "kavout",                      # 演算法分析稿（如「…a new benchmark for…」這類軟文框架）
+    "ad hoc news", "ad-hoc-news",  # 內容回收站（weekly outlook / 填充稿）；降級為只在有具體新事實時才報
 }
 
 # ── 噪音標題樣式（永遠擋掉，送進 Claude 前就刪）───────────────────
@@ -93,6 +100,12 @@ NOISE_TITLE_PATTERNS = {
     "sells shares of", "buys shares of", "purchases shares of",
     "million position in", "million stake in", "million holdings in",
     "position lifted", "position raised", "position trimmed", "position boosted",
+    # 純股價波動 / 技術線型 / 每日漲跌 recap（對長線零訊號；prompt 已要求略過，這裡做硬刪雙保險）
+    # 註：「% this week」較廣，理論上可能誤殺「raises distribution 5% this week」之類，
+    #     但本語料幾乎只出現在 bez-kabli 的週漲跌稿；若日後發現誤殺再拿掉即可。
+    "stock price forecast", "price forecast:", "resistance in focus",
+    "resistance as", "trades flat near", "outperforms market", "underperforms market",
+    "weekly outlook", "% this week", "shares finish week",
 }
 
 # ── 撞名硬刪（Brookfield 作為地名/小鎮/房產/學校，與持股無關）──────────
