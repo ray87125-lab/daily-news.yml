@@ -21,8 +21,25 @@
   ★本次新增：kavout（演算法軟文）、ad hoc news（內容回收站）也納入降級。
 - 【修死連結】resolve_link()：用 googlenewsdecoder 還原 Google News 加密轉址；失敗退回搜尋連結。
 
+2026-09-28 修正（依 9/24、9/26、9/27 三天的實際輸出回推）：
+- ★【連結全數變搜尋頁】googlenewsdecoder 0.2.x 把回傳鍵從 "status" 改成 "success"，
+  舊程式只認 "status"，於是每一則都判定解碼失敗、默默退回 news.google.com/search。
+  → _gnews_decode() 兩種鍵都認，失敗時把原因印到 log；workflow 請把版本釘住。
+- ★【持股漏標】Brookfield Renewable（Avaada）、Oaktree（Utmost）沒被標【持股】。
+  → prompt 加入 HOLDING_ENTITY_MAP：子公司／旗下平台 → 對應持股代號。
+- ★【舊聞當新聞】NAVER×Brookfield（7 月事件）9/24 又被當成新利多；7 天去重窗口太短。
+  → 標題記憶拉長到 TITLE_MEMORY_DAYS=90 天；超過 7 天的同一事件只有出現新的
+    具體事實（簽約／交割／金額變動）才報，並標【進度更新】、不計入情緒。
+- ★【情緒來源不明】9/26 情緒寫「BN、BEPC 觸及 52 週低點」，但報出的新聞沒有一則提到。
+  → 52-week 高低點稿在 Python 層硬刪；prompt 規定情緒只能根據「本次有報出」的新聞，
+    並依確定性（已完成 > 排他談判 > 非約束性 > 會面/計劃）與對持股的直接程度加權，
+    觀點稿、管理人自家研究、進度更新不計入。
+- 【管理人自家研究】Apollo 等自己發布的市場觀點當成公司事件報出 → prompt 規定降級為【觀點】或略過。
+- 【編號標記容錯】Claude 偶爾寫成 [[1]], [[5]] 或 [[1]]、[[5]]，舊 regex 只吃空白，
+  會在內文中間插出第二條網址 → inject_links 允許逗號／頓號分隔。
+
 由 GitHub Actions 觸發。環境變數（repo Secrets）：ANTHROPIC_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-依賴：pip install requests googlenewsdecoder
+依賴：pip install requests "googlenewsdecoder>=0.2.1,<0.3"   ← 請釘版本，0.2.x 需要 Python ≥ 3.11
 workflow 需 `permissions: contents: write` + `concurrency:` + 跑完 commit/push sent_state.json。
 """
 
@@ -50,7 +67,9 @@ TODAY = datetime.datetime.now(TAIPEI).strftime("%Y-%m-%d")
 
 # ── 去重 / 新鮮度設定 ────────────────────────────────────────
 STATE_FILE = Path("sent_state.json")
-DEDUP_DAYS = 7
+DEDUP_DAYS = 7                # 「近期」：同一事件在這段期間內一律不再報
+TITLE_MEMORY_DAYS = 90        # 標題記憶：超過 7 天的同一事件，只有新事實才以【進度更新】報
+TITLE_MEMORY_LIMIT = 600      # 餵給 Claude 的已發送標題上限（約 1.5 萬 input tokens）
 FRESH_HOURS = 48
 RESOLVE_LINKS = True          # 是否把 Google 加密轉址還原成真網址（False 則直接用原連結）
 
@@ -106,7 +125,22 @@ NOISE_TITLE_PATTERNS = {
     "stock price forecast", "price forecast:", "resistance in focus",
     "resistance as", "trades flat near", "outperforms market", "underperforms market",
     "weekly outlook", "% this week", "shares finish week",
+    # 52 週高低點稿（9/26 情緒段落引用了它，但它本身不該被報、也不該影響情緒）
+    "52-week low", "52-week high", "52 week low", "52 week high",
+    "new 52-week", "hits new low", "hits new high",
 }
+
+# ── 持股對應表（寫進 prompt，讓 Claude 把子公司／旗下平台標到正確的持股）──────
+HOLDING_ENTITY_MAP = """\
+- BN：Brookfield Corporation、Brookfield Asset Management（BAM）、Brookfield Wealth Solutions（BWS／BNT）、
+  Oaktree Capital（已 100% 併入，含 Howard Marks）、Brookfield Properties／Brookfield Property Partners（BPY）、
+  Brookfield Business Partners（BBU）、Brookfield 旗下各基金（轉型基金、AI 基建基金等）及其投資組合公司
+- BIPC：Brookfield Infrastructure（BIP／BIPC）及其投資組合公司
+- BEPC：Brookfield Renewable（BEP／BEPC）及其投資組合公司（例如 Avaada、Westinghouse 相關）
+- MQG：Macquarie Group、Macquarie Asset Management 及其投資組合公司
+- APO：Apollo Global Management、Athene 及其投資組合公司
+- KKR：KKR、Global Atlantic、FS KKR 及其投資組合公司
+一則新聞同時對應多檔時全部列出，例如【持股】BN／BEPC。"""
 
 # ── 撞名硬刪（Brookfield 作為地名/小鎮/房產/學校，與持股無關）──────────
 IRRELEVANT_TITLE_PATTERNS = {
@@ -180,17 +214,19 @@ def _entry_date(v) -> str:
 
 
 def save_state(state: dict) -> None:
+    # 保留 TITLE_MEMORY_DAYS 天（不是 DEDUP_DAYS），跨月的舊事件才認得出來
     cutoff = (
-        datetime.datetime.now(TAIPEI) - datetime.timedelta(days=DEDUP_DAYS)
+        datetime.datetime.now(TAIPEI) - datetime.timedelta(days=TITLE_MEMORY_DAYS)
     ).strftime("%Y-%m-%d")
     pruned = {k: v for k, v in state.items() if _entry_date(v) >= cutoff}
     STATE_FILE.write_text(json.dumps(pruned, ensure_ascii=False), "utf-8")
 
 
-def recent_sent_titles(state: dict, days: int = DEDUP_DAYS, limit: int = 200) -> list:
-    """近 N 天已發送過的標題（近的在前），給 Claude 做跨次語意去重用。
-    limit 拉高到 200：避免單一事件（如 Multiplex）的多個變體標題把窗口吃光，
-    害前一兩天發過的別件新聞（如 Csquare）掉出清單而被重報。"""
+def recent_sent_titles(
+    state: dict, days: int = TITLE_MEMORY_DAYS, limit: int = TITLE_MEMORY_LIMIT
+) -> list:
+    """近 N 天已發送過的 (日期, 標題)（近的在前），給 Claude 做跨次語意去重用。
+    帶日期是為了讓 Claude 分得出「7 天內＝一律不報」與「更早＝只有新事實才報」。"""
     cutoff = (
         datetime.datetime.now(TAIPEI) - datetime.timedelta(days=days)
     ).strftime("%Y-%m-%d")
@@ -199,7 +235,7 @@ def recent_sent_titles(state: dict, days: int = DEDUP_DAYS, limit: int = 200) ->
         if isinstance(v, dict) and v.get("t") and v.get("d", "") >= cutoff:
             rows.append((v["d"], v["t"]))
     rows.sort(reverse=True)
-    return [t for _, t in rows[:limit]]
+    return rows[:limit]
 
 
 def is_fresh(pub: str, hours: int = FRESH_HOURS) -> bool:
@@ -324,11 +360,17 @@ def build_prompt(news_block: str, recent_block: str) -> str:
 
 請你做的事：
 1. 只保留「真正重要」的新聞，過濾掉重複、無關、純股價波動、業配與舊聞。
-2. 對我的持股（BN／BIPC／BEPC／MQG／APO／KKR）有直接影響的放最前面，標記【持股】。
+2. 對我的持股（BN／BIPC／BEPC／MQG／APO／KKR）有直接影響的放最前面，標記【持股】並寫出對應代號。
+   標題只寫子公司或旗下平台名稱時，照下面的對應表判斷屬於哪一檔（例如 Brookfield Renewable → BEPC、Oaktree → BN）：
+{HOLDING_ENTITY_MAP}
 3. 摘要長度由標題實際資訊量決定：標題只講一件事，就用「一句話」照實複述；不要為了湊到 2-3 句而補上標題沒有的背景、動機、影響或解讀。只有標題本身就含多個事實時才寫到 2-3 句。寧可短，不要腦補。
 4. 優先呈報：實體資產出售、商用不動產壞帳/接管、併購與重組進度、評等與展望變動、配息/回購政策、旗艦基金募資與贖回(gate)、管理階層(如 Bruce Flatt、Howard Marks)發言或合作。
 5. 沒有重大新聞的板塊直接略過。若清單裡確實沒有重要的，就誠實說「今日無重大新聞」。
-6. 結尾給一句「今日板塊情緒：偏多／中性／偏空」並簡述理由。
+6. 結尾給一句「今日板塊情緒：偏多／中性／偏空」並簡述理由。情緒規則：
+   - 只能根據「這次有報出來」的新聞判斷；清單裡有、但你沒報的項目（股價漲跌、52 週高低點、被略過的稿子）一律不准拿來當理由。
+   - 依確定性加權：已完成／已交割／已公布財報 > 排他談判 > 非約束性承諾或傳聞 > 會面、計劃、「洽談中」。後兩類最多只能算微弱訊號。
+   - 依對持股的直接程度加權，不是依則數：同一天好幾筆小交易不等於偏多。
+   - 【觀點】與【進度更新】不計入情緒。
 
 【不准腦補敘事・最重要】
 - 除了標題字面明確寫出的事實，一律不准推論：不准推測公司動機、策略意圖、對股價或估值的影響、與其他公司的比較或分歧、交易背後的原因。
@@ -342,7 +384,10 @@ def build_prompt(news_block: str, recent_block: str) -> str:
 - 該略過的就靜默略過，連提都不要提；輸出裡不該有任何關於「去重／過濾／清單」的後設說明。
 
 【避免重複】
-- 下面「近期已發送」是過去幾天已報過的標題。今天清單若有一則和它其實是【同一件事】（同一筆交易／財報／報告／訴訟／13F／合作案），即使用字、角度、數字、來源不同，一律不要再報，也不要說明你略過了它。
+- 下面「已發送紀錄」是過去 {TITLE_MEMORY_DAYS} 天報過的標題，每行開頭有發送日期。
+- 發送日期在最近 {DEDUP_DAYS} 天內的：今天清單若有一則和它其實是【同一件事】（同一筆交易／財報／報告／訴訟／13F／合作案），即使用字、角度、數字、來源不同，一律不要再報，也不要說明你略過了它。
+- 發送日期早於 {DEDUP_DAYS} 天的：同一件事只有在標題出現「新的具體事實」時才報（例如從洽談變成簽約、完成交割、金額或條件改變、監管裁定）。要報就標【進度更新】，一句話寫出新增的那個事實，不計入情緒。標題看不出新事實的，靜默略過。
+- 即使不在紀錄裡，若標題明顯是在追述較早的事件（例如「繼 7 月宣布後…」「推進先前的…」），同樣視為【進度更新】處理，不要當成今天的新事件。
 - 今天清單內部若有多則是同一件事，只挑資訊量最高的一則報，其餘靜默併入或捨棄。
 - 特別注意「跟進報導」：一筆大型交易（例如某子公司出售案）成交後，接下來幾天會有大量不同媒體報導同一件事。只要這筆交易你先前已經報過，之後所有跟進報導一律直接不報，不論它是不是我的持股、不論又有幾家媒體跟進。不要「報一則然後加註『無新增事實／跟進報導』」——那還是重複。判斷標準只有一個：核心事件先前報過沒有？報過就丟，連提都不要提。
 
@@ -350,6 +395,7 @@ def build_prompt(news_block: str, recent_block: str) -> str:
 - 標記［觀點來源］的是分析/評論稿（Seeking Alpha、Motley Fool、Simply Wall St 等），不是第一手新聞。
 - 這類只有在「提供了清單裡其他第一手新聞沒有、且具體的新事實」時才報；否則一律略過。
 - 若真要報，標記改用【觀點】（不要用【持股】），並寫明這是第三方分析。
+- 資產管理公司「自己發布」的市場展望、研究報告、投資觀點（例如 Apollo、KKR、Oaktree、Brookfield 的 outlook／insights／memo）同樣屬於觀點，不是公司事件：只有在內容本身就是具體新事實時才報，並標【觀點】；否則略過。
 
 【排除噪音】
 - 跳過原告律所的「股東警示／集體訴訟召集／investigation」樣板稿，除非有具體且重大的法律進展（正式起訴、和解金額、法院裁定）。
@@ -363,7 +409,7 @@ def build_prompt(news_block: str, recent_block: str) -> str:
 
 輸出格式：純文字，適合 Telegram。每則之間空一行。開頭寫上日期。整體 2500 字以內。
 
-──── 近期已發送（過去 {DEDUP_DAYS} 天，請務必拿來比對去重）────
+──── 已發送紀錄（過去 {TITLE_MEMORY_DAYS} 天，格式「發送日期｜標題」，請務必拿來比對去重）────
 {recent_block}
 
 ──── 今日新聞清單 ────
@@ -412,15 +458,27 @@ def strip_meta_commentary(text: str) -> str:
 
 
 # ── 連結還原（修死連結）─────────────────────────────────────
+DECODE_STATS = Counter()
+
+
 def _gnews_decode(article_url):
-    """用維護中的 googlenewsdecoder 還原 Google News 加密轉址。失敗回 None。
-    若哪天整批失效，先 `pip install -U googlenewsdecoder` 升級；通常它會跟上 Google 的格式變動。"""
+    """用 googlenewsdecoder 還原 Google News 加密轉址。失敗回 None，並把原因印到 log。
+    ★ 0.1.x 回傳 {"status": True, "decoded_url": ...}；0.2.x 改成 {"success": True, ...}。
+      舊版只認 "status"，升到 0.2.x 後每則都被判失敗 → 全部退回搜尋連結（9 月下旬的症狀）。
+      這裡兩種都認；workflow 也請把版本釘住，避免下次又被無聲改版。"""
     try:
         res = gnewsdecoder(article_url, interval=1)
-        if res.get("status") and str(res.get("decoded_url", "")).startswith("http"):
-            return res["decoded_url"]
-    except Exception:
+    except Exception as e:
+        DECODE_STATS["exception"] += 1
+        print(f"decode exception: {type(e).__name__}: {e}", file=sys.stderr)
         return None
+    ok = bool(res.get("success") or res.get("status"))
+    url = str(res.get("decoded_url") or "")
+    if ok and url.startswith("http"):
+        DECODE_STATS["ok"] += 1
+        return url
+    DECODE_STATS["fail"] += 1
+    print(f"decode fail: {res.get('message') or res.get('error') or res}", file=sys.stderr)
     return None
 
 
@@ -442,7 +500,9 @@ def resolve_link(google_link: str, title: str) -> str:
             headers={"User-Agent": "Mozilla/5.0"},
         )
         final = r.url or ""
-        if final.startswith("http") and "news.google.com" not in final and "google.com/sorry" not in final:
+        host = urllib.parse.urlparse(final).hostname or ""
+        # 任何 google.com 網域（news / sorry / consent）都不是文章本身
+        if final.startswith("http") and not (host == "google.com" or host.endswith(".google.com")):
             return final
     except Exception:
         pass
@@ -455,7 +515,8 @@ def inject_links(digest: str, items: list):
     """把 [[編號]] 換成(還原後的)網址。同段多個來源只顯示第一個，但全部記為已發送。"""
     idx = {str(i): it for i, it in enumerate(items, 1)}
     sent_keys = set()
-    run = re.compile(r"\[\[\d+\]\](?:\s*\[\[\d+\]\])*")
+    # 容許 [[1]][[5]]、[[1]] [[5]]、[[1]], [[5]]、[[1]]、[[5]] 都算同一串
+    run = re.compile(r"\[\[\d+\]\](?:[\s,，、]*\[\[\d+\]\])*")
 
     def repl(m):
         nums = re.findall(r"\[\[(\d+)\]\]", m.group(0))
@@ -515,7 +576,9 @@ if __name__ == "__main__":
             save_state(sent_state)
             sys.exit(0)
 
-        recent_block = "\n".join(f"- {t}" for t in recent_sent_titles(sent_state)) or "（無）"
+        recent_block = (
+            "\n".join(f"- {d}｜{t}" for d, t in recent_sent_titles(sent_state)) or "（無）"
+        )
         digest = summarize(build_news_block(items), recent_block)
         digest = strip_meta_commentary(digest)          # 送出前剝掉殘留的後設說明
         final_text, sent_keys = inject_links(digest, items)
@@ -528,6 +591,10 @@ if __name__ == "__main__":
         save_state(sent_state)
 
         print(f"Sent OK；本次標記 {len(sent_keys)} 則為已發送", file=sys.stderr)
+        print(f"連結解碼：{dict(DECODE_STATS)}", file=sys.stderr)
+        if DECODE_STATS["ok"] == 0 and (DECODE_STATS["fail"] or DECODE_STATS["exception"]):
+            print("⚠️ 本次沒有任何連結解碼成功，全部是搜尋頁退路；請看上面的 decode fail 訊息。",
+                  file=sys.stderr)
     except Exception as e:
         try:
             send_telegram(f"⚠️ 今日新聞彙整失敗：{e}")
