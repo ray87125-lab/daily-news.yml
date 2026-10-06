@@ -73,6 +73,14 @@
 - 【只貼這一支也能跑】workflow 沒釘 selectolax 版本時，腳本在 GitHub Actions 上會自己 pip 裝回
   相容版再重啟一次；自救失敗才退回搜尋連結＋警告。workflow 那行有釘最好，沒釘也不會壞。
 
+2026-10-07 第三輪（第二輪上線後第一次手動跑的結果）：
+- 【📊 報出數灌水】「MQG 18→8」其實畫面上只有 3 則：舊算法把併進同一則的來源標題全算進去。
+  → 改成算「實際顯示的則數」。
+- 【括號註記】「（標題未揭露交易細節。）」「（此為 Brookfield 官方聲明…）」→ prompt 禁止＋送出前剝掉。
+- 【人事門檻】子公司通路主管任命（Global Atlantic 的 IMO／IBD 主管）被當成高層人事 → 限母公司 C-level／董事會。
+- 【情緒又是偏多】理由把「宣布收購」寫成「完成」，而且只挑正面的講（同一天的監管壓力、折價出售沒算）。
+  → 宣布收購對買方算中性；正反都要計入；動詞時態照標題。
+
 由 GitHub Actions 觸發。環境變數（repo Secrets）：ANTHROPIC_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 依賴：pip install requests "googlenewsdecoder>=0.2.1,<0.3" "selectolax>=0.4.12,<1.0"
       ← 兩個都要釘：0.2.x 需要 Python ≥ 3.11；selectolax 1.0 會讓 googlenewsdecoder 0.2.1 載不進來
@@ -541,8 +549,10 @@ def build_prompt(news_block: str, recent_block: str) -> str:
    標題只寫子公司或旗下平台名稱時，照下面的對應表判斷屬於哪一檔（例如 Brookfield Renewable → BEPC、Oaktree → BN）：
 {HOLDING_ENTITY_MAP}
    六檔持股同等重要：MQG、APO、KKR 的公司層級實質事件（併購／出售／入股、募資完成、財報與指引、評等變動、
-   監管與訴訟裁定、高層人事、配息／回購）和 Brookfield 的一樣要報，不要因為 Brookfield 相關的則數多就把它們擠掉。
+   監管與訴訟裁定、母公司層級的高層人事、配息／回購）和 Brookfield 的一樣要報，不要因為 Brookfield 相關的則數多就把它們擠掉。
    但也不要為了湊數放寬標準：某一檔今天沒有實質事件，就不報那一檔。
+   「高層人事」只算母公司的 CEO／CFO／董事長／董事會成員／事業群負責人；子公司或旗下平台的通路、區域、
+   部門主管任命（例如某保險子公司的通路主管）不報。
 3. 摘要長度由標題實際資訊量決定：標題只講一件事，就用「一句話」照實複述；不要為了湊到 2-3 句而補上標題沒有的背景、動機、影響或解讀。只有標題本身就含多個事實時才寫到 2-3 句。寧可短，不要腦補。
 4. 優先呈報：實體資產出售、商用不動產壞帳/接管、併購與重組進度、評等與展望變動、配息/回購政策、旗艦基金募資與贖回(gate)、管理階層(如 Bruce Flatt、Howard Marks)發言或合作。
 5. 沒有重大新聞的板塊直接略過。若清單裡確實沒有重要的，就誠實說「今日無重大新聞」。
@@ -555,6 +565,10 @@ def build_prompt(news_block: str, recent_block: str) -> str:
    - 單一 LP 的出資承諾、相對於該管理人規模微不足道的小額交易，算中性，不是利多。
    - 「啟動／推出／計畫／launch／drive／plan」這類還沒有成交或金額的消息，算中性。
    - 報出來的新聞裡，若沒有至少一則「已完成或已公布、且對持股有實質影響」的事件，情緒就寫中性。
+   - 「宣布／同意收購、入股、投資」對買方是資本配置，算中性，不因為金額大就算利多；
+     方向明確的才算（例如高於帳面價出售、募資完成且超標、財報優於預期、升評；反向亦同）。
+   - 正反都要計入：報出的新聞裡有監管壓力、被要求處分資產、折價出售、訴訟、調查，必須一起衡量，不能只挑正面的講。
+   - 動詞時態照標題：標題是 agrees／strikes deal／to buy／plans 就寫「宣布」「同意」「擬」，不准寫成「完成」。
    - 理由只講新聞內容本身，不要提「清單」「可計入」「略過」「不計入」這類描述你篩選過程的字眼。
 
 【不准腦補敘事・最重要】
@@ -570,6 +584,8 @@ def build_prompt(news_block: str, recent_block: str) -> str:
 - 只輸出最後選出來要報的新聞。不要解釋你過濾了什麼、跳過了什麼、為什麼跳過、哪些和近期已發送重複。
 - 禁止出現這類句子：「以下為今日無新增價值的項目」「此筆已多次發送，全數略過」「（注：…已於近期發送清單中已報…）」「已發送過」「未重複已發送內容」。
 - 該略過的就靜默略過，連提都不要提；輸出裡不該有任何關於「去重／過濾／清單」的後設說明。
+- 摘要裡不准出現「標題」兩個字，也不要加「（標題未揭露…）」「（此為官方聲明…）」這類括號註記；
+  標題沒講的事就不要寫，不需要聲明它沒講。
 
 【避免重複】
 - 下面「已發送紀錄」是過去 {TITLE_MEMORY_DAYS} 天報過的標題，每行開頭有發送日期。
@@ -640,6 +656,8 @@ def strip_meta_commentary(text: str) -> str:
     text = re.sub(r"（\s*[注註][：:][^）]*(?:發送|重複|略過|清單)[^）]*）", "", text)
     # 1b) 去掉說明「為什麼算進度更新」的括號，例如（核心事件先前已報，新事實：…）
     text = re.sub(r"[（(][^）)]*(?:先前已報|已報過|先前報過|新事實[：:])[^）)]*[）)]", "", text)
+    # 1c) 去掉提到「標題」的括號註記，例如（標題未揭露交易細節。）（此為官方聲明，標題未揭露協議細節。）
+    text = re.sub(r"[ \t]*[（(][^）)\n]*標題[^）)\n]*[）)]", "", text)
     # 2) 逐行刪掉純後設說明的行（但保留任何含編號標記的行）
     kept = []
     for line in text.splitlines():
@@ -852,9 +870,11 @@ def resolve_link(google_link: str, title: str) -> str:
 
 
 def inject_links(digest: str, items: list):
-    """把 [[編號]] 換成(還原後的)網址。同段多個來源只顯示第一個，但全部記為已發送。"""
+    """把 [[編號]] 換成(還原後的)網址。同段多個來源只顯示第一個，但全部記為已發送。
+    回傳 (文字, 已發送的 key 集合, 實際顯示的那幾則)。"""
     idx = {str(i): it for i, it in enumerate(items, 1)}
     sent_keys = set()
+    shown_items = []   # 每一則摘要實際顯示連結的那個來源（一則摘要算一個，併入的不重複算）
     # 容許 [[1]][[5]]、[[1]] [[5]]、[[1]], [[5]]、[[1]]、[[5]] 都算同一串（與 verify_numbers 共用 MARKER_RUN）
     run = MARKER_RUN
 
@@ -869,10 +889,11 @@ def inject_links(digest: str, items: list):
             if not shown:
                 url = resolve_link(it["link"], it["title"])
                 shown = f"\n{url}\n🕐 {it['pubDate']}"
+                shown_items.append(it)
         return shown
 
     text = run.sub(repl, digest)
-    return text, sent_keys
+    return text, sent_keys, shown_items
 
 
 # ── 送出 ───────────────────────────────────────────────────
@@ -934,11 +955,11 @@ if __name__ == "__main__":
         digest = summarize(build_news_block(items), recent_block)
         digest = strip_meta_commentary(digest)          # 送出前剝掉殘留的後設說明
         digest, num_fixes = verify_numbers(digest, items)   # 標題沒有的數字 → 刪子句／退回原標題
-        final_text, sent_keys = inject_links(digest, items)
+        final_text, sent_keys, shown_items = inject_links(digest, items)
 
         footer = []
         if SHOW_STATS_FOOTER:
-            reported = Counter(it["group"] for it in items if it["key"] in sent_keys)
+            reported = Counter(it["group"] for it in shown_items)   # 畫面上的則數，不是併入的標題數
             footer.append(
                 "📊 送審→報出："
                 + "｜".join(f"{g} {stats[g]['picked']}→{reported[g]}" for g in order)
