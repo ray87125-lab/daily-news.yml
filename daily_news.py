@@ -41,8 +41,18 @@
 - 【編號標記容錯】Claude 偶爾寫成 [[1]], [[5]] 或 [[1]]、[[5]]，舊 regex 只吃空白，
   會在內文中間插出第二條網址 → inject_links 允許逗號／頓號分隔。
 
+2026-10-07 修正（10/4 起連續失敗、而且 Telegram 完全沒通知）：
+- ★【整支在 import 就死】selectolax 1.0.0（2026-10-03 發布）拿掉了 Modest backend，
+  而 googlenewsdecoder 0.2.1 還在 `from selectolax.parser import HTMLParser`，
+  於是 `import googlenewsdecoder` 直接丟 ImportError。那一行在 try/except 外面，
+  所以連「⚠️ 今日新聞彙整失敗」都送不出來，只有 Actions 頁面是紅的。
+  → workflow 釘 `selectolax<1.0`（真正的修法）。
+  → 這裡把 import 改成「載不進來也照跑」：連結退回搜尋頁，並在訊息結尾加一行警告。
+     連結解碼只是加分功能，不該讓整份摘要陪葬。
+
 由 GitHub Actions 觸發。環境變數（repo Secrets）：ANTHROPIC_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-依賴：pip install requests "googlenewsdecoder>=0.2.1,<0.3"   ← 請釘版本，0.2.x 需要 Python ≥ 3.11
+依賴：pip install requests "googlenewsdecoder>=0.2.1,<0.3" "selectolax>=0.4.12,<1.0"
+      ← 兩個都要釘：0.2.x 需要 Python ≥ 3.11；selectolax 1.0 會讓 googlenewsdecoder 0.2.1 載不進來
 workflow 需 `permissions: contents: write` + `concurrency:` + 跑完 commit/push sent_state.json。
 """
 
@@ -59,7 +69,16 @@ from pathlib import Path
 from collections import Counter
 
 import requests
-from googlenewsdecoder import gnewsdecoder
+
+# 連結解碼套件是「加分功能」：載不進來就退回搜尋連結，不要讓整支腳本在 import 階段就死掉。
+# （2026-10-04～06 就是死在這一行，而且死在 try/except 之前，Telegram 完全沒收到失敗通知。）
+try:
+    from googlenewsdecoder import gnewsdecoder
+    GNEWS_IMPORT_ERROR = ""
+except Exception as _e:  # ImportError 之外，套件內部初始化出錯也一樣處理
+    gnewsdecoder = None
+    GNEWS_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
+    print(f"⚠️ googlenewsdecoder 載入失敗，連結將退回搜尋頁：{GNEWS_IMPORT_ERROR}", file=sys.stderr)
 
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -477,6 +496,9 @@ def _gnews_decode(article_url):
     ★ 0.1.x 回傳 {"status": True, "decoded_url": ...}；0.2.x 改成 {"success": True, ...}。
       舊版只認 "status"，升到 0.2.x 後每則都被判失敗 → 全部退回搜尋連結（9 月下旬的症狀）。
       這裡兩種都認；workflow 也請把版本釘住，避免下次又被無聲改版。"""
+    if gnewsdecoder is None:                 # 套件沒載進來（見檔頭 import 區）
+        DECODE_STATS["unavailable"] += 1
+        return None
     try:
         res = gnewsdecoder(article_url, interval=1)
     except Exception as e:
@@ -593,6 +615,12 @@ if __name__ == "__main__":
         digest = summarize(build_news_block(items), recent_block)
         digest = strip_meta_commentary(digest)          # 送出前剝掉殘留的後設說明
         final_text, sent_keys = inject_links(digest, items)
+        if GNEWS_IMPORT_ERROR:
+            # 讓我在 Telegram 上就看得到，不用等到哪天想起來去翻 Actions
+            final_text += (
+                "\n\n⚠️ 連結解碼套件載入失敗，本次連結皆為搜尋頁。原因："
+                + GNEWS_IMPORT_ERROR[:200]
+            )
         send_telegram(final_text)
 
         # 記下這次「實際發出去」的標題（含標題本身），下次才能做跨次語意去重
